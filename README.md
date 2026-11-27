@@ -91,6 +91,8 @@ chmod +x zswapmon
 sudo mv zswapmon /usr/local/bin/
 ```
 
+`.deb` packages (amd64, arm64, armhf) for Debian 12+, Ubuntu 22.04+ and Raspberry Pi OS are also available on the releases page: `sudo apt install ./zswapmon_<version>-1_<arch>.deb`
+
 ### From [AUR](https://aur.archlinux.org/packages/zswapmon-bin)
 
 ```bash

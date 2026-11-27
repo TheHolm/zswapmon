@@ -3,42 +3,224 @@ name: CI
 on:
   push:
     branches:
-    - action
+    - main
+    - deb-packaging
     tags:
-    - '*'
+    - 'v*'
+  pull_request:
+
+permissions:
+  contents: read
 
 jobs:
-  build_and_release:
-    name: zswapmon
+  build:
+    name: build (${{ matrix.deb_arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - target: x86_64-unknown-linux-musl
+          deb_arch: amd64
+          asset: zswapmon
+        - target: aarch64-unknown-linux-musl
+          deb_arch: arm64
+          asset: zswapmon-aarch64
+        # ARMv6 hard-float: runs on every Raspberry Pi (incl. Zero/1) and on ARMv7.
+        - target: arm-unknown-linux-musleabihf
+          deb_arch: armhf
+          asset: zswapmon-armhf
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+
+    - name: Setup zig
+      uses: mlugg/setup-zig@v2
+      with:
+        version: 0.17.1
+
+    - name: Install cargo-zigbuild and cargo-deb
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-zigbuild,cargo-deb
+
+    - name: Build
+      run: cargo zigbuild --release --target ${{ matrix.target }}
+
+    - name: Build .deb
+      run: >
+        cargo deb --target ${{ matrix.target }} --no-build --no-strip
+        --compress-type xz --output dist/
+
+    - name: Collect binary
+      run: cp target/${{ matrix.target }}/release/zswapmon dist/${{ matrix.asset }}
+
+    - name: UPX (amd64 only)
+      if: matrix.deb_arch == 'amd64'
+      run: |
+        sudo apt-get update -qq && sudo apt-get install -y -qq upx-ucl
+        upx -9 --best dist/zswapmon -o dist/zswapmon-upx
+
+    - name: Show artifacts
+      run: |
+        ls -l dist
+        file dist/*
+        dpkg-deb -I dist/*.deb
+        dpkg-deb -c dist/*.deb
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: build-${{ matrix.deb_arch }}
+        path: dist/*
+        if-no-files-found: error
+
+  test-deb:
+    name: install ${{ matrix.arch }} on ${{ matrix.image }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:12, ubuntu:22.04]
+        arch: [amd64, arm64, armhf]
+        include:
+        - image: debian:13
+          arch: amd64
+        - image: ubuntu:24.04
+          arch: amd64
+        - image: ubuntu:26.04
+          arch: amd64
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: build-${{ matrix.arch }}
+        path: dist
+
+    - name: Setup QEMU
+      if: matrix.arch != 'amd64'
+      uses: docker/setup-qemu-action@v3
+
+    - name: Install, run, remove
+      run: |
+        case ${{ matrix.arch }} in
+          amd64) platform=linux/amd64 ;;
+          arm64) platform=linux/arm64 ;;
+          armhf) platform=linux/arm/v7 ;;
+        esac
+        docker run --rm --platform "$platform" -v "$PWD/dist:/dist:ro" ${{ matrix.image }} sh -exc '
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get install -y /dist/zswapmon_*_${{ matrix.arch }}.deb
+          test -x /usr/bin/zswapmon
+          test -f /usr/share/doc/zswapmon/copyright
+          zswapmon --help
+          zswapmon --parameters || true
+          dpkg -r zswapmon
+          ! test -e /usr/bin/zswapmon
+        '
+
+  test-armv6:
+    name: armhf binary on ARMv6 CPU (Pi Zero/1)
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        name: build-armhf
+        path: dist
+
+    - name: Run under qemu-arm -cpu arm1176
+      run: |
+        sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user
+        chmod +x dist/zswapmon-armhf
+        qemu-arm -cpu arm1176 dist/zswapmon-armhf --help
+
+  archpkg:
+    name: archpkg (${{ matrix.carch }})
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - carch: x86_64
+          deb_arch: amd64
+          asset: zswapmon
+        - carch: aarch64
+          deb_arch: arm64
+          asset: zswapmon-aarch64
+        - carch: armv7h
+          deb_arch: armhf
+          asset: zswapmon-armhf
+    env:
+      ZSWAPMON_REPO: ${{ github.repository }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - uses: actions/download-artifact@v4
+      with:
+        name: build-${{ matrix.deb_arch }}
+        path: dist
+
+    - name: makepkg
+      run: |
+        VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+        sed -i "s/^pkgver=.*/pkgver='$VER'/" PKGBUILD
+        # Pre-place sources so makepkg uses them instead of downloading.
+        install -m755 "dist/${{ matrix.asset }}" "zswapmon-$VER-${{ matrix.carch }}"
+        # package() only copies files, so packaging for another CARCH is safe.
+        cp /etc/makepkg.conf /tmp/makepkg.conf
+        echo 'CARCH="${{ matrix.carch }}"' >> /tmp/makepkg.conf
+        useradd -m build
+        chown -R build .
+        su build -c "ZSWAPMON_REPO='$ZSWAPMON_REPO' makepkg --config /tmp/makepkg.conf --nodeps --noconfirm"
+        mkdir -p out && mv ./*.pkg.tar.zst out/
+        ls -l out
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: archpkg-${{ matrix.carch }}
+        path: out/*.pkg.tar.zst
+        if-no-files-found: error
+
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, test-deb, test-armv6, archpkg]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+    - name: Checkout
+      uses: actions/checkout@v4
 
-      - name: Checkout
-        uses: actions/checkout@v2
+    - name: Check tag matches Cargo.toml version
+      run: |
+        VER=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)
+        if [ "${GITHUB_REF_NAME}" != "v$VER" ]; then
+          echo "Tag ${GITHUB_REF_NAME} does not match Cargo.toml version v$VER" >&2
+          exit 1
+        fi
 
-      - name: Setup toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
+    - uses: actions/download-artifact@v4
+      with:
+        path: dist
+        merge-multiple: true
 
-      - name: Build
-        run: >
-          sudo bash -c 'apt update && apt install upx binutils -y';
-          cargo build --release;
-          strip -s -R .comment -R .gnu.version --strip-unneeded target/x86_64-unknown-linux-musl/release/zswapmon;
-          upx -9 --best target/x86_64-unknown-linux-musl/release/zswapmon -o target/x86_64-unknown-linux-musl/release/zswapmon-upx;
-
-      - name: Build archlinux package
-        uses: countstarlight/arch-makepkg-action@master
-        with:
-          scripts: "cp target/x86_64-unknown-linux-musl/release/{zswapmon,zswapmon-upx} . && makepkg"
-
-      - name: Release
-        uses: softprops/action-gh-release@v1
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: zswapmon*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Release
+      uses: softprops/action-gh-release@v2
+      with:
+        fail_on_unmatched_files: true
+        files: |
+          dist/zswapmon
+          dist/zswapmon-upx
+          dist/zswapmon-aarch64
+          dist/zswapmon-armhf
+          dist/zswapmon_*.deb
+          dist/zswapmon-bin-*.pkg.tar.zst
